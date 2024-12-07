@@ -79,6 +79,7 @@ class Board:
         self.turn = self.ORANGE  # Orange (player) goes first
         self.game_over = False
         self.winner = None
+        self.move_history = []  # List of (piece, old_pos, new_pos, captured_pieces, was_king)
 
     def create_board(self):
         for row in range(BOARD_SIZE):
@@ -118,7 +119,13 @@ class Board:
             moves.update(self._traverse_left(row + 1, min(row + 3, BOARD_SIZE), 1, piece.color, left))
             moves.update(self._traverse_right(row + 1, min(row + 3, BOARD_SIZE), 1, piece.color, right))
         
-        return moves
+        # Filter out moves to white squares
+        valid_moves = {}
+        for (row, col), captures in moves.items():
+            if (row + col) % 2 == 1:  # Black squares have odd sum of row and column
+                valid_moves[(row, col)] = captures
+        
+        return valid_moves
 
     def _traverse_left(self, start, stop, step, color, left, skipped=None):
         """Helper method to check diagonal moves to the left"""
@@ -210,62 +217,102 @@ class Board:
 
     def select(self, row: int, col: int) -> bool:
         """Select a piece and calculate its valid moves"""
+        # Only allow selection of pieces on black squares
+        if (row + col) % 2 == 0:  # White square
+            return
+
         if self.selected_piece:
             result = self._move(row, col)
             if not result:
                 self.selected_piece = None
                 self.select(row, col)
-            return result
-
+        
         piece = self.get_piece(row, col)
-        if piece and piece.color == self.ORANGE:  # Only allow selecting orange pieces (player's pieces)
+        if piece and piece.color == self.turn:
             self.selected_piece = piece
             self.valid_moves = self.get_valid_moves(piece)
             return True
-        
+            
         return False
 
-    def _move(self, row: int, col: int) -> bool:
+    def _move(self, row: int, col: int):
         """Move a piece and handle captures"""
         piece = self.selected_piece
-        if piece and (row, col) in self.valid_moves:
-            # Store original position for logging
-            from_pos = (piece.row, piece.col)
-            
-            # Move the piece
-            self.board[piece.row][piece.col] = None
-            self.board[row][col] = piece
-            piece.row = row
-            piece.col = col
-            piece.calc_pos()
-            
-            # Remove captured pieces and update score
-            captured = self.valid_moves[(row, col)]
-            if captured:
-                for captured_piece in captured:
-                    self.board[captured_piece.row][captured_piece.col] = None
-                    if piece.color == self.ORANGE:
-                        self.orange_score += 1
-                    else:
-                        self.gray_score += 1
-            
-            # Make kings
-            if row == 0 and piece.color == self.ORANGE:
-                piece.make_king()
-            elif row == BOARD_SIZE - 1 and piece.color == self.GRAY:
-                piece.make_king()
-            
-            self.selected_piece = None
-            self.valid_moves = {}
-            
-            # Switch turns only if no more captures are available
-            new_moves = self.get_valid_moves(piece)
-            if not new_moves or not any(captures for captures in new_moves.values()):
-                self.turn = self.GRAY if self.turn == self.ORANGE else self.ORANGE
-            
+        old_row, old_col = piece.row, piece.col
+        was_king = piece.king
+        self.board[piece.row][piece.col] = None
+        captured_pieces = []
+
+        if self.valid_moves.get((row, col)):
+            captured_pieces = self.valid_moves[(row, col)]
+            for captured in captured_pieces:
+                self.board[captured.row][captured.col] = None
+                if captured.color == self.ORANGE:
+                    self.gray_score += 1
+                else:
+                    self.orange_score += 1
+
+        piece.row = row
+        piece.col = col
+        piece.calc_pos()
+        self.board[row][col] = piece
+
+        # Record move in history
+        move_record = (piece, (old_row, old_col), (row, col), captured_pieces, was_king)
+        self.move_history.append(move_record)
+
+        # Check if piece should become king
+        if row == 0 and piece.color == self.ORANGE:
+            piece.make_king()
+        elif row == BOARD_SIZE - 1 and piece.color == self.GRAY:
+            piece.make_king()
+
+        self.valid_moves = {}
+        self.selected_piece = None
+        self.turn = self.GRAY if self.turn == self.ORANGE else self.ORANGE
+
+        return True
+
+    def undo_move(self):
+        """Undo the last two moves (player's move and AI's move)"""
+        if not self.move_history or self.game_over:
+            return False
+
+        # Undo AI's move if it exists
+        if len(self.move_history) >= 1 and self.turn == self.ORANGE:
+            self._undo_single_move()
+            # Undo player's move
+            if self.move_history:
+                self._undo_single_move()
             return True
-        
         return False
+
+    def _undo_single_move(self):
+        """Helper method to undo a single move"""
+        if not self.move_history:
+            return
+
+        piece, old_pos, new_pos, captured_pieces, was_king = self.move_history.pop()
+        
+        # Restore piece to original position
+        self.board[new_pos[0]][new_pos[1]] = None
+        piece.row, piece.col = old_pos
+        piece.calc_pos()
+        self.board[old_pos[0]][old_pos[1]] = piece
+        
+        # Restore king status
+        piece.king = was_king
+        
+        # Restore captured pieces
+        for captured in captured_pieces:
+            self.board[captured.row][captured.col] = captured
+            if captured.color == self.ORANGE:
+                self.gray_score -= 1
+            else:
+                self.orange_score -= 1
+
+        # Switch turn back
+        self.turn = self.GRAY if self.turn == self.ORANGE else self.ORANGE
 
     def ai_move(self):
         """Make AI move"""
@@ -276,6 +323,10 @@ class Board:
             self.selected_piece = piece
             self.valid_moves = {new_pos: captures}
             self._move(new_pos[0], new_pos[1])
+        else:
+            # AI has no legal moves, player wins
+            self.game_over = True
+            self.winner = self.ORANGE
 
     def get_piece(self, row: int, col: int) -> Optional[Piece]:
         return self.board[row][col]
@@ -318,7 +369,12 @@ class Board:
         
         # Draw turn indicator centered below the scores
         turn_text = font.render("Your Turn" if self.turn == self.ORANGE else "AI's Turn", True, self.turn)
-        screen.blit(turn_text, (WINDOW_SIZE // 2 - turn_text.get_width() // 2, WINDOW_SIZE + 45))
+        screen.blit(turn_text, (WINDOW_SIZE // 2 - turn_text.get_width() // 2, WINDOW_SIZE + 15))
+
+        # Draw undo hint
+        if self.turn == self.ORANGE and len(self.move_history) >= 2:
+            undo_text = font.render("Press 'Z' to Undo", True, WHITE)
+            screen.blit(undo_text, (WINDOW_SIZE // 2 - undo_text.get_width() // 2, WINDOW_SIZE + 45))
 
     def draw_game_over(self, screen):
         """Draw game over screen"""
@@ -397,11 +453,14 @@ def main():
                     pygame.quit()
                     sys.exit()
                 
-                if event.type == pygame.KEYDOWN and board.game_over:
-                    if event.key == pygame.K_SPACE:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE and board.game_over:
                         # Reset the game
                         board = Board()
                         continue
+                    elif event.key == pygame.K_z and board.turn == board.ORANGE:
+                        # Undo last move
+                        board.undo_move()
                 
                 if event.type == pygame.MOUSEBUTTONDOWN and board.turn == board.ORANGE and not board.game_over:
                     pos = pygame.mouse.get_pos()
